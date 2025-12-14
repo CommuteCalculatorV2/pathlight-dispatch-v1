@@ -1,9 +1,11 @@
 import os
 import tempfile
+import time
+import uuid
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 from openai import OpenAI
 
 app = FastAPI(title="PathLight Dispatch v1")
@@ -31,46 +33,46 @@ async def dispatch(
     mode: str = Form("talk"),
     audio: UploadFile = File(...),
 ):
-    # Basic guardrails
+    req_id = str(uuid.uuid4())
+    t0 = time.time()
+
     if not audio.filename:
         raise HTTPException(status_code=400, detail="Missing audio file")
-    if audio.content_type and "audio" not in audio.content_type:
-        raise HTTPException(status_code=415, detail=f"Unsupported content_type: {audio.content_type}")
 
-    # Save upload to a temp file so OpenAI SDK can read it as a file handle
-    suffix = os.path.splitext(audio.filename)[1] or ".m4a"
+    # Accept common audio extensions; don't over-trust content_type.
+    ext = os.path.splitext(audio.filename)[1].lower()
+    if ext not in {".m4a", ".mp3", ".wav", ".webm", ".aac"}:
+        # Still allow octet-stream with no extension if you want; for now be explicit.
+        raise HTTPException(status_code=415, detail=f"Unsupported file extension: {ext or '(none)'}")
+
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        contents = await audio.read()
+        if len(contents) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Audio too large")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".m4a") as tmp:
             tmp_path = tmp.name
-            contents = await audio.read()
-            # Optional size limit (e.g., 25MB)
-            if len(contents) > 25 * 1024 * 1024:
-                raise HTTPException(status_code=413, detail="Audio too large")
             tmp.write(contents)
 
-        # 1) Speech -> Text (transcriptions)
-        # Models include whisper-1 and newer transcribe snapshots. :contentReference[oaicite:3]{index=3}
+        # 1) Speech -> Text
         with open(tmp_path, "rb") as f:
             tx = client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=f,
             )
-        transcript = (tx.text or "").strip()
-        if not transcript:
-            transcript = "(no speech detected)"
 
-        # 2) Text -> Reply (Responses API) :contentReference[oaicite:4]{index=4}
+        transcript = (getattr(tx, "text", "") or "").strip() or "(no speech detected)"
+
+        # 2) Text -> Reply
         system_prompt = (
             "You are Dispatch inside PathLight AR. "
-            "Be concise, friendly, and accessible for a blind user using VoiceOver. "
-            "Prefer short sentences and direct answers. "
-            "If the user asks for notes, preferences, or memory, say you can do that (we'll add it next)."
+            "Be concise, calm, and accessible for a blind user using VoiceOver. "
+            "Use short sentences. One idea per sentence. Avoid emojis. "
+            "If the user asks to save notes or preferences, say you can do that (coming next)."
         )
 
-        user_prompt = transcript
-        if mode and mode != "talk":
-            # keep your existing mode hook alive
-            user_prompt = f"[mode={mode}] {transcript}"
+        user_prompt = transcript if (not mode or mode == "talk") else f"[mode={mode}] {transcript}"
 
         resp = client.responses.create(
             model="gpt-4o-mini",
@@ -79,20 +81,23 @@ async def dispatch(
                 {"role": "user", "content": user_prompt},
             ],
         )
-        reply = (resp.output_text or "").strip()
-        if not reply:
-            reply = "I’m here. What would you like to ask?"
+
+        reply = (getattr(resp, "output_text", "") or "").strip() or "I’m here. What would you like to ask?"
+
+        dt_ms = int((time.time() - t0) * 1000)
+        print(f"✅ /dispatch req_id={req_id} mode={mode} ms={dt_ms} transcript_len={len(transcript)} reply_len={len(reply)}")
 
         return DispatchOut(transcript=transcript, reply=reply)
 
     except HTTPException:
+        print(f"⚠️ /dispatch req_id={req_id} HTTPException")
         raise
     except Exception as e:
-        # Avoid leaking internals to client; keep server logs for debugging
+        print(f"❌ /dispatch req_id={req_id} error={type(e).__name__}")
         raise HTTPException(status_code=500, detail=f"Dispatch error: {type(e).__name__}")
     finally:
-        try:
-            if "tmp_path" in locals() and os.path.exists(tmp_path):
+        if tmp_path:
+            try:
                 os.remove(tmp_path)
-        except Exception:
-            pass
+            except Exception:
+                pass
