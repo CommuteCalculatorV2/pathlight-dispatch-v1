@@ -4,9 +4,10 @@ import time
 import uuid
 import base64
 import re
-from typing import Optional, Dict, Any
+import json
+from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, RateLimitError, BadRequestError
@@ -23,11 +24,27 @@ app.add_middleware(
 
 client = OpenAI()  # uses OPENAI_API_KEY from env
 
+# -----------------------------
+# Config: Feedback visibility
+# -----------------------------
+# If set, /feedback endpoints require ?token=...
+FEEDBACK_TOKEN = os.getenv("FEEDBACK_TOKEN", "").strip()
+
+# Optional persistence file (JSON Lines)
+# Example: set on Render as /tmp/pathlight_feedback.jsonl
+FEEDBACK_STORE_PATH = os.getenv("FEEDBACK_STORE_PATH", "").strip()
+
+# Cap to prevent runaway memory
+MAX_FEEDBACK_ITEMS = int(os.getenv("MAX_FEEDBACK_ITEMS", "200"))
+
+# In-memory feedback store
+# Each item: {id, ts, note, transcript, req_id}
+FEEDBACK: List[Dict[str, Any]] = []
+
 
 # -----------------------------
 # Models
 # -----------------------------
-
 class DispatchAction(BaseModel):
     name: str
     args: Dict[str, Any] = {}
@@ -41,10 +58,17 @@ class DispatchOut(BaseModel):
     action: DispatchAction | None = None
 
 
-# -----------------------------
-# Helpers: simple action parsing
-# -----------------------------
+class FeedbackItem(BaseModel):
+    id: str
+    ts: float
+    note: str
+    transcript: str
+    req_id: str
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -113,13 +137,11 @@ def parse_action(transcript: str) -> Optional[DispatchAction]:
     m = re.search(r"(?:voice)\s*(?:to|=)?\s*([a-zA-Z0-9_-]+)", t)
     if m:
         voice = m.group(1).strip().lower()
-        # Don't hard-fail here; let the client set it. If invalid, server will show BadRequest.
         return DispatchAction(name="set_voice", args={"voice": voice})
 
     # Feedback capture
-    # e.g. "send feedback: the button is hard to tap"
+    # e.g. "feedback: the button is hard to tap"
     if "feedback" in t:
-        # Try to grab what's after "feedback"
         note = transcript
         m2 = re.search(r"feedback\s*[:\-]\s*(.*)$", transcript, re.IGNORECASE)
         if m2:
@@ -129,13 +151,58 @@ def parse_action(transcript: str) -> Optional[DispatchAction]:
     return None
 
 
+def _require_feedback_token(token: Optional[str]):
+    if FEEDBACK_TOKEN:
+        if not token or token.strip() != FEEDBACK_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _append_feedback(item: Dict[str, Any]):
+    FEEDBACK.append(item)
+    # Cap memory
+    if len(FEEDBACK) > MAX_FEEDBACK_ITEMS:
+        del FEEDBACK[0 : (len(FEEDBACK) - MAX_FEEDBACK_ITEMS)]
+
+    # Optional persistence (best effort)
+    if FEEDBACK_STORE_PATH:
+        try:
+            with open(FEEDBACK_STORE_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"⚠️ feedback persist failed path={FEEDBACK_STORE_PATH} err={type(e).__name__} {str(e)[:200]}")
+
+
 # -----------------------------
 # Routes
 # -----------------------------
-
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/feedback", response_model=List[FeedbackItem])
+def list_feedback(
+    token: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """
+    View recent feedback items.
+    Optional token gate via FEEDBACK_TOKEN env var.
+    """
+    _require_feedback_token(token)
+    items = FEEDBACK[-limit:]
+    return items[::-1]  # newest first
+
+
+@app.get("/feedback/latest", response_model=Optional[FeedbackItem])
+def latest_feedback(token: Optional[str] = Query(default=None)):
+    """
+    Quick check for the most recent feedback item.
+    """
+    _require_feedback_token(token)
+    if not FEEDBACK:
+        return None
+    return FEEDBACK[-1]
 
 
 @app.post("/dispatch", response_model=DispatchOut)
@@ -176,6 +243,19 @@ async def dispatch(
 
         # 2) Decide if this is a pilot-control command
         action = parse_action(transcript)
+
+        # 2b) If save_feedback, store it immediately (so we never “lose” it)
+        if action and action.name == "save_feedback":
+            note = str(action.args.get("note", "")).strip() or transcript
+            item = {
+                "id": str(uuid.uuid4()),
+                "ts": time.time(),
+                "note": note,
+                "transcript": transcript,
+                "req_id": req_id,
+            }
+            _append_feedback(item)
+            print(f"📝 feedback saved id={item['id']} req_id={req_id} note={note[:140]}")
 
         # 3) Text -> Reply
         system_prompt = (
@@ -239,7 +319,7 @@ async def dispatch(
         raise HTTPException(status_code=429, detail="Dispatch is busy. Please try again in a moment.")
 
     except BadRequestError as e:
-        # This is the one you want for voice/param issues — prints exact error to Render logs.
+        # Voice/param issues — prints exact error to Render logs.
         print(f"❌ /dispatch req_id={req_id} bad_request: {e}")
         raise HTTPException(status_code=400, detail="Bad request to speech service")
 
