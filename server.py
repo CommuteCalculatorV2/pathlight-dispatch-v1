@@ -1,145 +1,385 @@
-import os
-import tempfile
-import time
-import uuid
-import base64
+import Foundation
+import AVFoundation
+import Combine
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from openai import OpenAI, RateLimitError, BadRequestError
+@MainActor
+final class DispatchConversationManager: NSObject, ObservableObject {
 
-app = FastAPI(title="PathLight Dispatch v1")
+    // MARK: - UI state
+    @Published var isRecording = false
+    @Published var lastTranscript: String = ""
+    @Published var lastReply: String = ""
+    @Published var status: String = "Ready"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you want
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    // MARK: - Server-side TTS knobs
+    @Published var useServerTTS: Bool = true
+    @Published var selectedVoice: String = "nova"   // server default; change anytime
 
-client = OpenAI()  # uses OPENAI_API_KEY from env
+    // Delay server audio playback to avoid VoiceOver overlap
+    @Published var replyPlaybackDelaySeconds: Double = 3.0
 
-class DispatchOut(BaseModel):
-    transcript: str
-    reply: str
-    audio_b64: str | None = None
-    audio_mime: str | None = None
+    // MARK: - Audio
+    private var recorder: AVAudioRecorder?
+    private let audioSession = AVAudioSession.sharedInstance()
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    private var audioPlayer: AVAudioPlayer?
+    private var lastServerAudioData: Data? = nil
+    private var lastServerAudioMime: String? = nil
 
-@app.post("/dispatch", response_model=DispatchOut)
-async def dispatch(
-    mode: str = Form("talk"),
-    audio: UploadFile = File(...),
-    voice: str = Form("nova"),          # e.g. nova, alloy, etc.
-    tts: str = Form("1"),               # "1" = return audio, "0" = text-only
-):
-    req_id = str(uuid.uuid4())
-    t0 = time.time()
+    // MARK: - Pilot controls (local knobs)
+    // These drive the actual PathLight audio mix (beeps + any local speech that uses the mixer).
+    // If you want, we can also persist this to AppStorage later.
+    @Published var pilotMasterVolume: Float = 0.5 {
+        didSet { pilotMasterVolume = max(0.0, min(1.0, pilotMasterVolume)) }
+    }
 
-    if not audio.filename:
-        raise HTTPException(status_code=400, detail="Missing audio file")
+    // Point this at YOUR backend (Render)
+    var dispatchEndpoint: URL =
+        URL(string: "https://pathlight-dispatch-v1.onrender.com/dispatch")!
 
-    # Accept common audio extensions; don't over-trust content_type.
-    ext = os.path.splitext(audio.filename)[1].lower()
-    if ext not in {".m4a", ".mp3", ".wav", ".webm", ".aac"}:
-        raise HTTPException(status_code=415, detail=f"Unsupported file extension: {ext or '(none)'}")
+    // MARK: - Recording
 
-    tmp_path = None
-    try:
-        contents = await audio.read()
-        if len(contents) > 25 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Audio too large")
+    func startRecording() {
+        do {
+            status = "Starting mic…"
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".m4a") as tmp:
-            tmp_path = tmp.name
-            tmp.write(contents)
-
-        # 1) Speech -> Text
-        with open(tmp_path, "rb") as f:
-            tx = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .spokenAudio,
+                options: [.defaultToSpeaker, .allowBluetooth]
             )
+            try audioSession.setActive(true)
 
-        transcript = (getattr(tx, "text", "") or "").strip() or "(no speech detected)"
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("dispatch-\(UUID().uuidString).m4a")
 
-        # 2) Text -> Reply
-        system_prompt = (
-            "You are Dispatch inside PathLight AR. "
-            "Be concise, calm, and accessible for a blind user using VoiceOver. "
-            "Use short sentences. One idea per sentence. Avoid emojis. "
-            "If the user asks to save notes or preferences, say you can do that (coming next)."
-        )
+            let settings: [String: Any] = [
+                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            ]
 
-        user_prompt = transcript if (not mode or mode == "talk") else f"[mode={mode}] {transcript}"
+            recorder = try AVAudioRecorder(url: url, settings: settings)
+            recorder?.prepareToRecord()
+            recorder?.record()
 
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+            isRecording = true
+            status = "Recording…"
 
-        reply = (getattr(resp, "output_text", "") or "").strip() or "I’m here. What would you like to ask?"
+        } catch {
+            status = "Mic error: \(error.localizedDescription)"
+        }
+    }
 
-        # 3) Reply -> Speech (optional)
-        want_tts = (tts.strip() != "0")
-        audio_b64 = None
-        audio_mime = None
-        audio_size = 0
+    func stopRecordingAndSend() async {
+        guard let recorder else { return }
 
-        if want_tts:
-            tts_resp = client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice=voice,
-                input=reply,
-                response_format="mp3",   # ✅ correct param name
+        recorder.stop()
+        isRecording = false
+        status = "Uploading…"
+
+        let audioURL = recorder.url
+        self.recorder = nil
+
+        do {
+            let result = try await sendToBackend(audioURL: audioURL)
+            lastTranscript = result.transcript
+            lastReply = result.reply
+            status = "Done"
+
+            // Execute pilot action after we have a reply (safe ordering)
+            if let action = result.action {
+                await applyPilotAction(action, replyText: result.reply)
+            }
+
+            // Play server audio (delayed to prevent VoiceOver overlap)
+            if let audioData = result.audioData {
+                lastServerAudioData = audioData
+                lastServerAudioMime = result.audioMime
+                await playServerAudioDelayed(audioData, delaySeconds: replyPlaybackDelaySeconds)
+            } else {
+                print("ℹ️ No server audio returned (tts disabled or server text-only).")
+            }
+
+        } catch {
+            status = "Dispatch error: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Pilot Action Model
+
+    struct PilotAction: Decodable {
+        let name: String
+        let args: [String: AnyDecodable]?
+
+        func argString(_ key: String) -> String? { args?[key]?.stringValue }
+        func argBool(_ key: String) -> Bool? { args?[key]?.boolValue }
+        func argDouble(_ key: String) -> Double? { args?[key]?.doubleValue }
+        func argFloat(_ key: String) -> Float? {
+            if let d = args?[key]?.doubleValue { return Float(d) }
+            return nil
+        }
+    }
+
+    // Tiny helper to decode "args" as heterogenous JSON
+    struct AnyDecodable: Decodable {
+        let value: Any
+
+        var stringValue: String? { value as? String }
+        var boolValue: Bool? { value as? Bool }
+        var doubleValue: Double? {
+            if let d = value as? Double { return d }
+            if let i = value as? Int { return Double(i) }
+            return nil
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let b = try? c.decode(Bool.self) { value = b; return }
+            if let i = try? c.decode(Int.self) { value = i; return }
+            if let d = try? c.decode(Double.self) { value = d; return }
+            if let s = try? c.decode(String.self) { value = s; return }
+            if let dict = try? c.decode([String: AnyDecodable].self) { value = dict; return }
+            if let arr = try? c.decode([AnyDecodable].self) { value = arr; return }
+            value = NSNull()
+        }
+    }
+
+    // MARK: - Apply pilot controls
+
+    private func applyPilotAction(_ action: PilotAction, replyText: String) async {
+        print("🧭 PilotAction name=\(action.name)")
+
+        switch action.name {
+
+        case "repeat_last":
+            // Prefer repeating the last server audio for maximum "ChatGPT-like" feel.
+            if let data = lastServerAudioData {
+                await playServerAudioDelayed(data, delaySeconds: 0.2)
+            } else {
+                // If no audio cached, just re-hit the delay (text is already on-screen)
+                print("ℹ️ repeat_last: no cached server audio")
+            }
+
+        case "help":
+            // No local change needed; server reply will explain commands.
+            break
+
+        case "set_tts":
+            if let enabled = action.argBool("enabled") {
+                useServerTTS = enabled
+                print("🔧 set_tts enabled=\(enabled)")
+            }
+
+        case "set_voice":
+            if let v = action.argString("voice"), !v.isEmpty {
+                selectedVoice = v
+                print("🎙 set_voice \(v)")
+            }
+
+        case "adjust_volume":
+            let delta = action.argFloat("delta") ?? 0.0
+            setMasterVolume(pilotMasterVolume + delta)
+
+        case "set_volume":
+            if let v = action.argFloat("value") {
+                setMasterVolume(v)
+            }
+
+        case "save_feedback":
+            let note = action.argString("note") ?? replyText
+            saveFeedbackNote(note)
+
+        default:
+            print("ℹ️ Unknown action: \(action.name)")
+        }
+    }
+
+    private func setMasterVolume(_ v: Float) {
+        let clamped = max(0.0, min(1.0, v))
+        pilotMasterVolume = clamped
+
+        // Drive your shared audio engine if you want volume to affect PathLight beeps too:
+        AudioCueEngine.shared.masterVolume = clamped
+
+        print("🔊 pilotMasterVolume=\(clamped)")
+    }
+
+    private func saveFeedbackNote(_ note: String) {
+        let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        do {
+            let dir = try ensureFeedbackDir()
+            let file = dir.appendingPathComponent("feedback.jsonl")
+
+            let payload: [String: Any] = [
+                "ts": ISO8601DateFormatter().string(from: Date()),
+                "note": trimmed
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+            let line = String(data: data, encoding: .utf8)! + "\n"
+
+            if FileManager.default.fileExists(atPath: file.path) {
+                let handle = try FileHandle(forWritingTo: file)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: line.data(using: .utf8)!)
+                try handle.close()
+            } else {
+                try line.data(using: .utf8)!.write(to: file)
+            }
+
+            print("📝 Saved feedback: \(trimmed) -> \(file.lastPathComponent)")
+        } catch {
+            print("❌ Failed to save feedback: \(error.localizedDescription)")
+        }
+    }
+
+    private func ensureFeedbackDir() throws -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = docs.appendingPathComponent("PathLightFeedback", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    // MARK: - Playback helpers
+
+    private func playServerAudioDelayed(_ data: Data, delaySeconds: Double) async {
+        let ns = UInt64(max(0.0, delaySeconds) * 1_000_000_000.0)
+        if ns > 0 {
+            try? await Task.sleep(nanoseconds: ns)
+        }
+        playServerAudio(data)
+    }
+
+    private func playServerAudio(_ data: Data) {
+        do {
+            audioPlayer?.stop()
+            audioPlayer = try AVAudioPlayer(data: data)
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+            print("🔊 Playing server TTS audio_bytes=\(data.count)")
+        } catch {
+            print("❌ Audio playback error: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Networking
+
+    private struct BackendResponse: Decodable {
+        let transcript: String
+        let reply: String
+        let audio_b64: String?
+        let audio_mime: String?
+        let action: PilotAction?
+    }
+
+    private struct BackendResult {
+        let transcript: String
+        let reply: String
+        let audioData: Data?
+        let audioMime: String?
+        let action: PilotAction?
+    }
+
+    private func sendToBackend(audioURL: URL) async throws -> BackendResult {
+
+        var request = URLRequest(url: dispatchEndpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 45   // Render can be slow on wake
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        print("➡️ Dispatch request: \(request.httpMethod ?? "nil") \(request.url?.absoluteString ?? "nil")")
+
+        var body = Data()
+
+        func addField(name: String, value: String) {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(value)\r\n".data(using: .utf8)!)
+        }
+
+        func addFile(name: String, filename: String, mime: String, data: Data) {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+            body.append("Content-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
+            body.append(data)
+            body.append("\r\n".data(using: .utf8)!)
+        }
+
+        // Fields
+        addField(name: "mode", value: "pathlight_dispatch_v1")
+        addField(name: "voice", value: selectedVoice)
+        addField(name: "tts", value: useServerTTS ? "1" : "0")
+
+        let audioData = try Data(contentsOf: audioURL)
+        addFile(name: "audio", filename: "speech.m4a", mime: "audio/mp4", data: audioData)
+
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+
+        func doRequest() async throws -> (Data, HTTPURLResponse) {
+            let (data, resp) = try await URLSession.shared.data(for: request)
+            guard let http = resp as? HTTPURLResponse else {
+                throw NSError(
+                    domain: "DispatchHTTP",
+                    code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "No HTTPURLResponse"]
+                )
+            }
+            return (data, http)
+        }
+
+        var (data, http) = try await doRequest()
+
+        if [502, 503, 504].contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? "(no body)"
+            print("⏳ Dispatch gateway \(http.statusCode) (cold start?) body=\(bodyText)")
+            status = "Waking server…"
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            (data, http) = try await doRequest()
+        }
+
+        if http.statusCode == 429 {
+            let bodyText = String(data: data, encoding: .utf8) ?? "(no body)"
+            print("⚠️ Dispatch HTTP 429 rate_limited body=\(bodyText)")
+            throw NSError(
+                domain: "DispatchHTTP",
+                code: 429,
+                userInfo: [NSLocalizedDescriptionKey: "Dispatch is busy. Try again in a moment."]
             )
-            audio_bytes = tts_resp.read()
-            audio_size = len(audio_bytes)
-            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            audio_mime = "audio/mpeg"
+        }
 
-        dt_ms = int((time.time() - t0) * 1000)
-        print(
-            f"✅ /dispatch req_id={req_id} mode={mode} ms={dt_ms} "
-            f"transcript_len={len(transcript)} reply_len={len(reply)} "
-            f"tts={want_tts} voice={voice} audio_bytes={audio_size}"
+        if http.statusCode != 200 {
+            let bodyText = String(data: data, encoding: .utf8) ?? "(no body)"
+            print("❌ Dispatch HTTP \(http.statusCode) URL=\(request.url?.absoluteString ?? "nil") body=\(bodyText)")
+            throw NSError(
+                domain: "DispatchHTTP",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(bodyText)"]
+            )
+        }
+
+        let decoded = try JSONDecoder().decode(BackendResponse.self, from: data)
+        print("✅ Dispatch OK transcript_len=\(decoded.transcript.count) reply_len=\(decoded.reply.count) action=\(decoded.action?.name ?? "none")")
+
+        var audioBytes: Data? = nil
+        if let b64 = decoded.audio_b64 {
+            audioBytes = Data(base64Encoded: b64)
+        }
+
+        return BackendResult(
+            transcript: decoded.transcript,
+            reply: decoded.reply,
+            audioData: audioBytes,
+            audioMime: decoded.audio_mime,
+            action: decoded.action
         )
-
-        return DispatchOut(
-            transcript=transcript,
-            reply=reply,
-            audio_b64=audio_b64,
-            audio_mime=audio_mime,
-        )
-
-    except RateLimitError:
-        print(f"⚠️ /dispatch req_id={req_id} rate_limited")
-        raise HTTPException(status_code=429, detail="Dispatch is busy. Please try again in a moment.")
-
-    except BadRequestError as e:
-        # Prints real OpenAI error details into Render logs (safe), client gets a clean message.
-        print(f"❌ /dispatch req_id={req_id} bad_request: {e}")
-        raise HTTPException(status_code=400, detail="Bad request to speech service")
-
-    except HTTPException:
-        print(f"⚠️ /dispatch req_id={req_id} HTTPException")
-        raise
-
-    except Exception as e:
-        print(f"❌ /dispatch req_id={req_id} error={type(e).__name__}")
-        raise HTTPException(status_code=500, detail=f"Dispatch error: {type(e).__name__}")
-
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+    }
+}
