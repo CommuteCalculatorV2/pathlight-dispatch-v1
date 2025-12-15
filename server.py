@@ -7,7 +7,7 @@ import base64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI, RateLimitError
+from openai import OpenAI, RateLimitError, BadRequestError
 
 app = FastAPI(title="PathLight Dispatch v1")
 
@@ -99,7 +99,7 @@ async def dispatch(
                 model="gpt-4o-mini-tts",
                 voice=voice,
                 input=reply,
-                format="mp3",
+                response_format="mp3",   # ✅ correct param name
             )
             audio_bytes = tts_resp.read()
             audio_size = len(audio_bytes)
@@ -121,9 +121,13 @@ async def dispatch(
         )
 
     except RateLimitError:
-        # This is the one you hit earlier — report it cleanly for the client.
         print(f"⚠️ /dispatch req_id={req_id} rate_limited")
         raise HTTPException(status_code=429, detail="Dispatch is busy. Please try again in a moment.")
+
+    except BadRequestError as e:
+        # Prints real OpenAI error details into Render logs (safe), client gets a clean message.
+        print(f"❌ /dispatch req_id={req_id} bad_request: {e}")
+        raise HTTPException(status_code=400, detail="Bad request to speech service")
 
     except HTTPException:
         print(f"⚠️ /dispatch req_id={req_id} HTTPException")
